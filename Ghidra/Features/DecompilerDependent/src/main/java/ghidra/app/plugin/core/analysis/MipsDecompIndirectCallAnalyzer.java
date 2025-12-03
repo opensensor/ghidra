@@ -118,9 +118,9 @@ public class MipsDecompIndirectCallAnalyzer extends AbstractAnalyzer {
                 Varnode target = callind.getInput(0);
                 if (target == null) continue;
 
-                // Determine parameter count to build function pointer type
-                int paramCount = Math.max(0, f.getParameterCount());
-                PointerDataType funcPtr = new PointerDataType(createFuncDef("fp_sig" + paramCount, paramCount), program.getDataTypeManager());
+                // Use permissive varargs function pointer type to avoid arity feedback loops
+                PointerDataType funcPtr =
+                    new PointerDataType(createFuncDef("mips_indirect_cb", 0), program.getDataTypeManager());
 
                 // Prefer retyping through the decompiler's HighSymbol and commit to DB
                 HighVariable hv = target.getHigh();
@@ -218,13 +218,9 @@ public class MipsDecompIndirectCallAnalyzer extends AbstractAnalyzer {
     private FunctionDefinitionDataType createFuncDef(String name, int paramCount) {
         FunctionDefinitionDataType def = new FunctionDefinitionDataType(name);
         def.setReturnType(VoidDataType.dataType);
-        if (paramCount > 0) {
-            ParameterDefinition[] params = new ParameterDefinition[paramCount];
-            for (int i = 0; i < paramCount; i++) {
-                params[i] = new ParameterDefinitionImpl("param_" + (i + 1), Undefined4DataType.dataType, "");
-            }
-            def.setArguments(params);
-        }
+        // Always use a permissive varargs signature so the decompiler does not prune arguments
+        def.setArguments(new ParameterDefinition[0]);
+        def.setVarArgs(true);
         return def;
     }
 

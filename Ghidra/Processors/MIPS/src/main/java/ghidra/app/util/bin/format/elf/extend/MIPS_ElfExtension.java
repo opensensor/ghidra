@@ -27,6 +27,7 @@ import ghidra.program.model.address.*;
 import ghidra.program.model.data.*;
 import ghidra.program.model.lang.Language;
 import ghidra.program.model.lang.Register;
+import ghidra.program.model.lang.RegisterValue;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.*;
 import ghidra.program.model.scalar.Scalar;
@@ -758,6 +759,10 @@ public class MIPS_ElfExtension extends ElfExtension {
 		super.processGotPlt(elfLoadHelper, monitor);
 
 		processMipsStubsSection(elfLoadHelper, monitor);
+
+		// Paint $gp register value over executable sections so that
+		// SymbolicPropogator can resolve $gp-relative accesses
+		processMipsGpContext(elfLoadHelper, monitor);
 	}
 
 	private void processMipsStubsSection(ElfLoadHelper elfLoadHelper, TaskMonitor monitor)
@@ -772,6 +777,88 @@ public class MIPS_ElfExtension extends ElfExtension {
 		ElfDefaultGotPltMarkup defaultGotPltMarkup = new ElfDefaultGotPltMarkup(elfLoadHelper);
 		defaultGotPltMarkup.processLinkageTable(MIPS_STUBS_SECTION_NAME, stubsBlock.getStart(),
 			stubsBlock.getEnd(), monitor);
+	}
+
+	/**
+	 * Paint the $gp register value over executable sections.
+	 * This allows SymbolicPropogator to resolve $gp-relative accesses during analysis
+	 * without requiring each function to re-discover the $gp value.
+	 *
+	 * Following the pattern used by X86_32_ElfExtension for EBX register context.
+	 *
+	 * @param elfLoadHelper ELF load helper
+	 * @param monitor task monitor
+	 * @throws CancelledException if cancelled
+	 */
+	private void processMipsGpContext(ElfLoadHelper elfLoadHelper, TaskMonitor monitor)
+			throws CancelledException {
+
+		Program program = elfLoadHelper.getProgram();
+		Register gpReg = program.getRegister("gp");
+		if (gpReg == null) {
+			return; // Not a MIPS program with gp register
+		}
+
+		// Try to find the $gp value from symbols created during ELF loading
+		// Priority: _mips_gp_value (from DT_MIPS_GP_VALUE) > _mips_gp0_value (from reginfo)
+		Long gpValue = getGpValueFromSymbol(program, MIPS_GP_VALUE_SYMBOL);
+		if (gpValue == null) {
+			gpValue = getGpValueFromSymbol(program, MIPS_GP0_VALUE_SYMBOL);
+		}
+		if (gpValue == null) {
+			// Try common linker-generated symbols
+			gpValue = getGpValueFromSymbol(program, "_gp");
+			if (gpValue == null) {
+				gpValue = getGpValueFromSymbol(program, MIPS_GP_GNU_LOCAL_SYMBOL_NAME);
+			}
+		}
+
+		if (gpValue == null) {
+			// No $gp value found - this may be a relocatable object or kernel module
+			// that needs call-graph based $gp propagation (handled by analyzer)
+			elfLoadHelper.log("No MIPS $gp value found - $gp-relative analysis may be limited");
+			return;
+		}
+
+		// Paint $gp over all executable memory blocks
+		Memory memory = program.getMemory();
+		RegisterValue gpRegValue = new RegisterValue(gpReg, BigInteger.valueOf(gpValue));
+
+		for (MemoryBlock block : memory.getBlocks()) {
+			monitor.checkCancelled();
+			if (block.isExecute()) {
+				try {
+					program.getProgramContext()
+							.setRegisterValue(block.getStart(), block.getEnd(), gpRegValue);
+				}
+				catch (ContextChangeException e) {
+					// Should not happen during import before disassembly
+					Msg.error(this, "Failed to set $gp context for block " + block.getName(), e);
+				}
+			}
+		}
+
+		elfLoadHelper.log("Set $gp register context to 0x" + Long.toHexString(gpValue) +
+			" over executable sections");
+	}
+
+	/**
+	 * Get the $gp value from a symbol's address.
+	 * The $gp symbols are created with their address set to the $gp value itself.
+	 *
+	 * @param program the program
+	 * @param symbolName the symbol name to look for
+	 * @return the $gp value, or null if symbol not found
+	 */
+	private Long getGpValueFromSymbol(Program program, String symbolName) {
+		Symbol sym = SymbolUtilities.getLabelOrFunctionSymbol(program, symbolName, err -> {});
+		if (sym != null) {
+			long value = sym.getAddress().getOffset();
+			if (value != 0) {
+				return value;
+			}
+		}
+		return null;
 	}
 
 	private void fixupGot(ElfLoadHelper elfLoadHelper, TaskMonitor monitor)
