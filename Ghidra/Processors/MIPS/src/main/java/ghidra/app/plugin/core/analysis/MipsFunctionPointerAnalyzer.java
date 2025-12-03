@@ -24,17 +24,13 @@ import ghidra.app.services.AnalyzerType;
 import ghidra.app.util.importer.MessageLog;
 import ghidra.framework.options.Options;
 import ghidra.program.model.address.*;
-import ghidra.program.model.data.*;
 import ghidra.program.model.lang.Processor;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.Memory;
 import ghidra.program.model.mem.MemoryBlock;
-import ghidra.program.model.pcode.Varnode;
 import ghidra.program.model.scalar.Scalar;
 import ghidra.program.model.symbol.*;
-import ghidra.program.util.SymbolicPropogator;
-import ghidra.program.util.VarnodeContext;
 import ghidra.util.Msg;
 import ghidra.util.exception.CancelledException;
 import ghidra.util.exception.InvalidInputException;
@@ -917,90 +913,6 @@ public class MipsFunctionPointerAnalyzer extends AbstractAnalyzer {
 	}
 
 	/**
-	 * Try to resolve an indirect call by checking if it loads from a known function pointer table.
-	 * This handles patterns like:
-	 *   lui $v0, 0x7
-	 *   addiu $v0, $v0, 0xa764
-	 *   lw $t9, 0x10($v0)    # Load from table at 0x7a764 + 0x10
-	 *   jr $t9
-	 */
-	private Address tryResolveFromTables(Program program, Instruction jalrInstr, Register targetReg,
-			List<FunctionPointerTable> tables) {
-
-		// Track backward to find the lw instruction
-		Instruction current = jalrInstr.getPrevious();
-		int searchLimit = 50;  // Search further for register calculations
-
-		while (current != null && searchLimit-- > 0) {
-			String mnemonic = current.getMnemonicString();
-
-			if (mnemonic.equals("lw") || mnemonic.equals("_lw")) {
-				Register destReg = current.getRegister(0);
-
-				if (destReg != null && destReg.equals(targetReg)) {
-					// Found the load - try to calculate the address
-					// Pattern 1: Absolute address (rare)
-					if (current.getNumOperands() >= 2) {
-						Object[] opObjs = current.getOpObjects(1);
-						for (Object obj : opObjs) {
-							if (obj instanceof Address) {
-								Address loadAddr = (Address) obj;
-								Address resolved = checkTableMatch(program, loadAddr, tables);
-								if (resolved != null) return resolved;
-							}
-						}
-					}
-
-					// Pattern 2: Register-relative: lw $dest, offset($base)
-					// Need to track the base register to find the table address
-					String op1 = current.getDefaultOperandRepresentation(1);
-					if (op1.contains("(") && op1.contains(")")) {
-						int openParen = op1.indexOf('(');
-						int closeParen = op1.indexOf(')');
-						String offsetStr = op1.substring(0, openParen).trim();
-						String baseRegName = op1.substring(openParen + 1, closeParen).trim();
-
-						// Parse the offset
-						long offset = 0;
-						try {
-							if (offsetStr.startsWith("0x") || offsetStr.startsWith("-0x")) {
-								offset = Long.parseLong(offsetStr.replace("0x", "").replace("-0x", "-"), 16);
-							} else if (!offsetStr.isEmpty()) {
-								offset = Long.parseLong(offsetStr);
-							}
-						} catch (NumberFormatException e) {
-							// Can't parse offset
-							break;
-						}
-
-						// Track the base register backward to find its value
-						Register baseReg = program.getRegister(baseRegName);
-						if (baseReg != null) {
-							Address baseAddr = trackRegisterValue(program, current, baseReg);
-							if (baseAddr != null) {
-								try {
-									Address loadAddr = baseAddr.add(offset);
-									Address resolved = checkTableMatch(program, loadAddr, tables);
-									if (resolved != null) return resolved;
-								} catch (Exception e) {
-									// Address calculation failed
-								}
-							}
-						}
-					}
-
-					// Couldn't resolve this load
-					break;
-				}
-			}
-
-			current = current.getPrevious();
-		}
-
-		return null;
-	}
-
-	/**
 	 * Check if an address falls within a known function pointer table and return the target.
 	 */
 	private Address checkTableMatch(Program program, Address loadAddr, List<FunctionPointerTable> tables) {
@@ -1303,15 +1215,20 @@ public class MipsFunctionPointerAnalyzer extends AbstractAnalyzer {
 
 	/**
 	 * Get the $gp (global pointer) value for a given address.
-	 * MIPS kernel modules can have multiple $gp values for different sections.
+	 *
+	 * The primary method is reading from ProgramContext, which is now reliably set by:
+	 * 1. MIPS_ElfExtension.processMipsGpContext() at ELF load time (paints $gp over executable sections)
+	 * 2. MipsGpPropagationAnalyzer for kernel modules (propagates $gp through call graph)
+	 *
+	 * Fallback methods are kept for compatibility with older imports or edge cases.
 	 */
 	private Long getGlobalPointerValue(Program program, Address addr) {
 		try {
-			// Method 1: Try to get $gp from program context register
-			// This is the most reliable method - the loader sets this
-			ghidra.program.model.lang.Register gpReg = program.getRegister("gp");
+			// Primary method: Get $gp from program context register
+			// This should work for most cases after Phase 1/2 infrastructure
+			Register gpReg = program.getRegister("gp");
 			if (gpReg != null) {
-				ghidra.program.model.listing.ProgramContext context = program.getProgramContext();
+				ProgramContext context = program.getProgramContext();
 				ghidra.program.model.lang.RegisterValue gpValue = context.getRegisterValue(gpReg, addr);
 				if (gpValue != null && gpValue.hasValue()) {
 					long gp = gpValue.getUnsignedValue().longValue();
@@ -1322,42 +1239,14 @@ public class MipsFunctionPointerAnalyzer extends AbstractAnalyzer {
 				}
 			}
 
-			// Method 2: Look for GOT memory blocks
-			// The loader creates blocks like "%got.text" with specific $gp values
-			MemoryBlock block = program.getMemory().getBlock(addr);
-			if (block != null) {
-				String blockName = block.getName();
-
-				// Try to find the corresponding GOT block
-				for (MemoryBlock mb : program.getMemory().getBlocks()) {
-					String mbName = mb.getName();
-					if (mbName.startsWith("%got")) {
-						// Found a GOT block - $gp points to GOT + 0x7ff0
-						long gotStart = mb.getStart().getOffset();
-						long gp = gotStart + 0x7ff0;
-						Msg.debug(this, "  Got $gp from GOT block " + mbName + ": 0x" + Long.toHexString(gp));
-						return gp;
-					}
-				}
-			}
-
-			// Method 3: Try program properties
-			Options props = program.getOptions(Program.PROGRAM_INFO);
-			if (props.contains("_mips_gp0_value")) {
-				long gp = props.getLong("_mips_gp0_value", 0L);
-				if (gp != 0) {
-					Msg.debug(this, "  Got $gp from program properties: 0x" + Long.toHexString(gp));
-					return gp;
-				}
-			}
-
-			// Method 4: Look for .got section and calculate
+			// Fallback: Look for .got section and calculate $gp = GOT + 0x7ff0
+			// This handles older imports that didn't have $gp context painting
 			for (MemoryBlock mb : program.getMemory().getBlocks()) {
 				String mbName = mb.getName();
-				if (mbName.equals(".got") || mbName.contains("got")) {
+				if (mbName.equals(".got") || mbName.startsWith("%got")) {
 					long gotStart = mb.getStart().getOffset();
 					long gp = gotStart + 0x7ff0;
-					Msg.debug(this, "  Got $gp from .got section: 0x" + Long.toHexString(gp));
+					Msg.debug(this, "  Got $gp from GOT section " + mbName + ": 0x" + Long.toHexString(gp));
 					return gp;
 				}
 			}
